@@ -6,7 +6,7 @@ Simbios, the NIH National Center for Physics-Based Simulation of
 Biological Structures at Stanford, funded under the NIH Roadmap for
 Medical Research, grant U54 GM072970. See https://simtk.org.
 
-Portions copyright (c) 2021-2025 Stanford University and the Authors.
+Portions copyright (c) 2021-2026 Stanford University and the Authors.
 Authors: Peter Eastman
 Contributors: Stephen Farr
 
@@ -29,8 +29,10 @@ OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
 USE OR OTHER DEALINGS IN THE SOFTWARE.
 """
 import openmm
+from openmm import unit
 from openmmml.mlpotential import MLPotentialImpl, MLPotentialImplFactory
 from typing import Iterable, Optional
+from functools import partial
 
 class TorchMDNetPotentialImplFactory(MLPotentialImplFactory):
     """This is the factory that creates TorchMDNetPotentialImpl objects."""
@@ -123,13 +125,13 @@ class TorchMDNetPotentialImpl(MLPotentialImpl):
         except ImportError as e:
             raise ImportError(f"Failed to import torchmdnet please install from https://torchmd-net.readthedocs.io/en/latest/installation.html")
         import torch
-        import openmmtorch
 
         includedAtoms = list(topology.atoms())
         if atoms is not None:
             includedAtoms = [includedAtoms[i] for i in atoms]
-        numbers = torch.tensor([atom.element.atomic_number for atom in includedAtoms])
-        charge = torch.tensor([args.get('charge', 0)], dtype=torch.float32)
+        device = self._getTorchDevice(args)
+        numbers = torch.tensor([atom.element.atomic_number for atom in includedAtoms], device=device, requires_grad=False)
+        charge = torch.tensor([args.get('charge', 0)], dtype=torch.float32, device=device, requires_grad=False)
 
         if self.name == 'torchmdnet':
             # a local path to a torchmdnet checkpoint must be provided 
@@ -164,51 +166,56 @@ class TorchMDNetPotentialImpl(MLPotentialImpl):
             max_num_neighbors = min(args.get('max_num_neighbors', 64), numbers.shape[0]),
             static_shapes = True,
             check_errors = False
-        )
+        ).to(device)
         for parameter in model.parameters():
             parameter.requires_grad = False
 
         batch = args.get('batch', None)
         if batch is None:
-            batch = torch.zeros_like(numbers)
+            batch = torch.zeros_like(numbers, requires_grad=False)
         else:
-            batch = torch.tensor(batch, dtype=torch.long)
+            batch = torch.tensor(batch, dtype=torch.long, device=device, requires_grad=False)
+        if atoms is None:
+            indices = None
+        else:
+            indices = torch.tensor(sorted(atoms), dtype=torch.int64, requires_grad=False)
+        periodic = (topology.getPeriodicBoxVectors() is not None) or system.usesPeriodicBoundaryConditions()
 
-        # TensorNet models can use CUDA graphs and the default is to use them.
-        use_cudagraphs = args.get('cudaGraphs', 
-                                True if (isinstance(model.representation_model, torchmdnet.models.tensornet.TensorNet)
-                                or isinstance(model.representation_model, torchmdnet.models.tensornet2.TensorNet2))
-                                else False
-                            )
+        # Create the PythonForce and add it to the System.
 
-        class TorchMDNetForce(torch.nn.Module):
-            def __init__(self, model, numbers, charge, atoms, batch, lengthScale, energyScale):
-                super(TorchMDNetForce, self).__init__()
-                self.model = model
-                self.numbers = torch.nn.Parameter(numbers, requires_grad=False)
-                self.charge = torch.nn.Parameter(charge, requires_grad=False)
-                self.batch = torch.nn.Parameter(batch, requires_grad=False)
-                self.lengthScale = lengthScale
-                self.energyScale = energyScale
-                if atoms is None:
-                    self.subset = False
-                    self.indices = torch.empty(1) # for torchscript
-                else:
-                    self.subset = True
-                    self.indices = torch.nn.Parameter(torch.tensor(sorted(atoms), dtype=torch.int64), requires_grad=False)
-                    
-            def forward(self, positions: torch.Tensor, boxvectors: Optional[torch.Tensor] = None):
-                positions = positions.to(torch.float32).to(self.numbers.device)
-                if self.subset:
-                    positions = positions[self.indices]
-
-                energy = self.model(z=self.numbers, pos=positions/self.lengthScale, batch=self.batch, q=self.charge)[0]
-                return energy*self.energyScale
-
-        # Create the TorchForce and add it to the System.
-        module = torch.jit.script(TorchMDNetForce(model, numbers, charge, atoms, batch, self.lengthScale, self.energyScale)).to(torch.device('cpu'))
-        force = openmmtorch.TorchForce(module)
-        if use_cudagraphs:
-            force.setProperty("useCUDAGraphs", "true")
+        compute = partial(_computeTorchMDNet,
+                          model=model,
+                          numbers=numbers,
+                          charge=charge,
+                          batch=batch,
+                          lengthScale=self.lengthScale,
+                          energyScale=self.energyScale,
+                          indices=indices,
+                          periodic=periodic)
+        force = openmm.PythonForce(compute)
         force.setForceGroup(forceGroup)
+        force.setUsesPeriodicBoundaryConditions(periodic)
         system.addForce(force)
+
+
+def _computeTorchMDNet(state, model, numbers, charge, batch, lengthScale, energyScale, indices, periodic):
+    import torch
+    import numpy as np
+    positions = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
+    numAtoms = positions.shape[0]
+    positions = torch.tensor(positions, dtype=torch.float32, device=numbers.device)
+    if indices is not None:
+        positions = positions[indices]
+    positions.requires_grad_(True)
+    if periodic:
+        cell = torch.tensor(state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.nanometer), dtype=torch.float32, device=numbers.device)/lengthScale
+    else:
+        cell = None
+    energy = model(z=numbers, pos=positions/lengthScale, batch=batch, q=charge, box=cell)[0]*energyScale
+    energy.backward()
+    forces = (-positions.grad).detach().cpu().numpy()
+    if indices is not None:
+        f = np.zeros((numAtoms, 3), dtype=np.float32)
+        f[indices] = forces
+        forces = f
+    return energy, forces
