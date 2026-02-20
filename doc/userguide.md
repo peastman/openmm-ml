@@ -131,7 +131,7 @@ When creating NequIP models, the following keyword arguments to the `MLPotential
 
 | Argument | Description |
 | --- | --- |
-| `modelPath` | The path to the file containing the model |
+| `modelPath` | The path to the checkpoint file containing the model |
 | `lengthScale` | The conversion factor from the model's length units to nanometers (e.g. 0.1 if the model uses Angstroms) |
 | `energyScale` | The conversion factor from the model's energy units to kJ/mol (e.g. 4.184 if the model uses kcal/mol) |
 
@@ -141,6 +141,7 @@ When using NequIP models, the following extra keyword arguments to `createSystem
 | --- | --- |
 | `precision` | The numerical precision of the model. Supported options are `'single'` and `'double'`.  If `None`, the default precision of the model is used. |
  | `atomTypes` | A list of integers corresponding to the NequiIP atom type for each ML atom in the system.  This is only required if the model was trained with custom atom types. If `None`, the atomic number is used to determine the atom type. This list should have the same length as the number of ML atoms in the system. |
+| `device` | The PyTorch device to perform calculations on, either a `torch.device` object or a string (such as `'cuda'` or `'cpu'`.)  If omitted, a device is chosen automatically. |
 
 ### TorchANI
 
